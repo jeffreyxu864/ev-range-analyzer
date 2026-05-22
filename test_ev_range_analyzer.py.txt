@@ -1,0 +1,216 @@
+import pytest
+from unittest.mock import patch, MagicMock
+
+from ev_range_analyzer import (
+    get_location,
+    get_elevation,
+    get_weather,
+    get_optimal_ev_speed,
+    get_tomtom_flow,
+    EVAnalyzer,
+)
+
+
+@patch("ev_range_analyzer.Nominatim")
+def test_get_location_success(mock_nominatim):
+    mock_geo = MagicMock()
+    mock_geo.geocode.return_value = MagicMock(
+        latitude=43.0,
+        longitude=-81.0,
+        address="London, Ontario, Canada",
+        raw={"boundingbox": [1, 2, 3, 4]},
+    )
+    mock_nominatim.return_value = mock_geo
+
+    result = get_location("London", "Canada")
+
+    assert result["lat"] == 43.0
+    assert result["lon"] == -81.0
+    assert result["address"] == "London, Ontario, Canada"
+
+
+@patch("ev_range_analyzer.Nominatim")
+def test_get_location_not_found(mock_nominatim):
+    mock_geo = MagicMock()
+    mock_geo.geocode.return_value = None
+    mock_nominatim.return_value = mock_geo
+
+    assert get_location("FakeCity", "Nowhere") is None
+
+
+@patch("ev_range_analyzer.requests.post")
+def test_get_elevation_success(mock_post):
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "results": [{"elevation": 250}]
+    }
+    mock_response.raise_for_status.return_value = None
+    mock_post.return_value = mock_response
+
+    elevation = get_elevation(43.0, -81.0)
+
+    assert elevation == 250
+
+
+@patch("ev_range_analyzer.requests.post")
+def test_get_elevation_failure(mock_post):
+    mock_post.side_effect = Exception("API down")
+
+    assert get_elevation(43.0, -81.0) is None
+
+
+@patch("ev_range_analyzer.requests.get")
+def test_get_weather_missing_data(mock_get, capsys):
+    mock_response = MagicMock()
+    mock_response.json.return_value = {}
+    mock_get.return_value = mock_response
+
+    result = get_weather(43.0, -81.0)
+
+    captured = capsys.readouterr()
+    assert "Weather API Error" in captured.out
+    assert result == {"temperature_avg": 15}
+
+
+@patch("ev_range_analyzer.requests.get")
+def test_get_weather_output(mock_get, capsys):
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "current": {
+            "temperature_2m": 10,
+            "relative_humidity_2m": 50,
+            "windspeed_10m": 20,
+            "precipitation": 1,
+        }
+    }
+    mock_get.return_value = mock_response
+
+    result = get_weather(43.0, -81.0)
+
+    captured = capsys.readouterr()
+    assert "Temperature: 10" in captured.out
+    assert "Humidity: 50" in captured.out
+    assert result == {"temperature_avg": 10}
+
+
+def test_optimal_speed_highway():
+    assert get_optimal_ev_speed("FRC1") == 90
+
+
+def test_optimal_speed_city():
+    assert get_optimal_ev_speed("FRC5") == 40
+
+
+@patch("ev_range_analyzer.requests.get")
+def test_get_tomtom_flow(mock_get):
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "flowSegmentData": {
+            "currentSpeed": 100,
+            "freeFlowSpeed": 80,
+            "currentTravelTime": 120,
+            "freeFlowTravelTime": 100,
+            "frc": "FRC1",
+        }
+    }
+    mock_get.return_value = mock_response
+
+    result = get_tomtom_flow(43.0, -81.0)
+
+    curr, opt, delay, impact = result
+
+    assert curr == 100
+    assert opt == 90
+    assert delay == 20
+    assert impact in ["DRAG LOSS", "OPTIMAL", "IDLE LOSS"]
+
+
+@patch("ev_range_analyzer.requests.get")
+def test_get_tomtom_flow_bad_response(mock_get):
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {}
+    mock_get.return_value = mock_response
+
+    result = get_tomtom_flow(43.0, -81.0)
+
+    assert result is None
+
+
+@patch("ev_range_analyzer.requests.get")
+def test_get_tomtom_flow_zero_division(mock_get):
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "flowSegmentData": {
+            "currentSpeed": 50,
+            "freeFlowSpeed": 0,
+            "currentTravelTime": 100,
+            "freeFlowTravelTime": 80,
+            "frc": "FRC1",
+        }
+    }
+    mock_get.return_value = mock_response
+
+    result = get_tomtom_flow(43.0, -81.0)
+
+    assert result is None
+
+
+def test_temperature_analysis_cold():
+    analyzer = EVAnalyzer({"temperature_avg": -15}, 100, [], {"congestion_ratio": 1})
+    result = analyzer.analyze_temperature()
+
+    assert result["score"] == 2
+
+
+def test_elevation_analysis_high():
+    analyzer = EVAnalyzer({}, 2500, [], {"congestion_ratio": 1})
+    result = analyzer.analyze_elevation()
+
+    assert result["score"] == 3
+
+
+def test_infrastructure_low():
+    analyzer = EVAnalyzer({}, 100, ["s1", "s2"], {"congestion_ratio": 1})
+    result = analyzer.analyze_infrastructure()
+
+    assert result["score"] == 1
+
+
+def test_traffic_analysis_moderate():
+    analyzer = EVAnalyzer({}, 100, [], {"congestion_ratio": 1.8})
+    result = analyzer.analyze_traffic()
+
+    assert result["score"] == 7
+
+
+def test_overall_score():
+    analyzer = EVAnalyzer(
+        {"temperature_avg": 10},
+        500,
+        ["s1", "s2", "s3", "s4", "s5"],
+        {"congestion_ratio": 1.2},
+    )
+
+    avg, factors = analyzer.overall_score()
+
+    assert len(factors) == 4
+    assert 0 <= avg <= 10
+
+
+def test_report_output(capsys):
+    analyzer = EVAnalyzer(
+        {"temperature_avg": 10},
+        500,
+        ["s1"] * 10,
+        {"congestion_ratio": 1.2},
+    )
+
+    analyzer.report()
+
+    captured = capsys.readouterr()
+
+    assert "EV Suitability Report" in captured.out
+    assert "Overall Score" in captured.out
